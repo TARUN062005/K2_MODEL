@@ -10,16 +10,22 @@ import io
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import seaborn as sns
 import traceback
 from datetime import datetime
+import logging
 import warnings
 warnings.filterwarnings('ignore')
 
 app = Flask(__name__)
 CORS(app)
 
-print(f"✅ K2 Server starting with NumPy {np.__version__}")
+# Logging and runtime toggles
+logging.basicConfig(level=logging.INFO)
+logging.info(f"✅ K2 Server starting with NumPy {np.__version__}")
+
+# Feature toggles for production
+ENABLE_DIAGRAMS = os.environ.get("ENABLE_DIAGRAMS", "true").lower() == "true"
+ALLOW_MOCK = os.environ.get("ALLOW_MOCK", "false").lower() == "true"
 
 # Global variables
 model = None
@@ -80,10 +86,20 @@ def load_trained_model():
                 print(f"✅ Model loaded: {type(model).__name__}")
             
             if model is not None and hasattr(model, 'predict'):
-                print("✅ K2 Model loaded successfully!")
+                logging.info("✅ K2 Model loaded successfully!")
+
+                # Validate label encoder class count matches model (fail safe)
+                if label_encoder and hasattr(model, 'n_classes_'):
+                    try:
+                        assert len(label_encoder.classes_) == getattr(model, 'n_classes_')
+                    except AssertionError:
+                        logging.error('LabelEncoder classes length mismatch with model.n_classes_. Unloading model for safety.')
+                        model = None
+                        return False
+
                 return True
             else:
-                print("⚠️ Model file doesn't contain a trained model")
+                logging.warning("⚠️ Model file doesn't contain a trained model")
                 model = None
                 return False
                 
@@ -370,6 +386,8 @@ def get_k2_explanation(predicted_class, confidence, input_features):
     else:
         return base_explanation
 
+# Load model at import time (safe for cloud imports)
+model_loaded = load_trained_model()
 # ----------------- API Endpoints -----------------
 
 @app.route('/')
@@ -431,10 +449,10 @@ def get_model_info():
             'selected_features': selected_features,
             'n_features': len(selected_features),
             'target_column': preprocessor.get('target_column', 'disposition') if preprocessor else 'disposition',
-            'accuracy': 0.82 if model_loaded else 0.0,
+            'accuracy': (preprocessor.get('accuracy') if preprocessor and model_loaded and preprocessor.get('accuracy') is not None else None),
             'training_samples': 7500 if model_loaded else 0,
             'capabilities': {
-                'generates_diagrams': True,
+                'generates_diagrams': ENABLE_DIAGRAMS,
                 'detailed_explanations': True,
                 'mock_predictions': not model_loaded
             }
@@ -462,9 +480,8 @@ def predict():
                 'error': 'No data provided'
             }), 400
         
-        print(f"📥 Received K2 prediction request")
-        print(f"🔍 Input features: {list(data.keys())}")
-        print(f"🔍 Expected features: {selected_features}")
+        logging.info("📥 Received K2 prediction request")
+        logging.debug(f"Expected features count: {len(selected_features)}")
         
         # Extract input data
         if isinstance(data, dict):
@@ -486,9 +503,13 @@ def predict():
         
         # Check if model is loaded and ready
         if model is None or not hasattr(model, 'predict'):
-            print("⚠️ Using enhanced K2 mock prediction")
-            
-            # Enhanced mock prediction logic
+            if not ALLOW_MOCK:
+                logging.error('Model not loaded and ALLOW_MOCK not enabled; returning 503')
+                return jsonify({'success': False, 'error': 'Model not loaded'}), 503
+
+            logging.warning('⚠️ Model not loaded; ALLOW_MOCK=true, returning mock prediction')
+
+            # Enhanced mock prediction logic (explicit fallback)
             score = 0
             
             if 'pl_rade' in input_data and input_data['pl_rade'] > 0.5:
@@ -574,8 +595,8 @@ def predict():
         # Generate explanation
         explanation = get_k2_explanation(predicted_class, confidence, input_data)
         
-        # Generate diagrams
-        charts = generate_k2_diagrams(predicted_class, confidence, probabilities, input_data)
+        # Generate diagrams (skip if disabled to reduce CPU & payload)
+        charts = generate_k2_diagrams(predicted_class, confidence, probabilities, input_data) if ENABLE_DIAGRAMS else {}
         
         # Prepare response
         result = {
@@ -596,7 +617,7 @@ def predict():
                 'expected_features': selected_features,
                 'timestamp': datetime.now().isoformat(),
                 'is_mock': is_mock,
-                'accuracy': 0.82
+                'accuracy': None
             },
             'diagrams': {
                 'available': len(charts) > 0,
@@ -690,26 +711,19 @@ if __name__ == '__main__':
     # Load model
     model_loaded = load_trained_model()
     
-    print("=" * 60)
-    print("🚀 K2 Mission Model Server Ready")
-    print("=" * 60)
-    print(f"📡 Port: 5003")
-    print(f"📊 Model loaded: {model_loaded}")
-    print(f"🔧 Features: {len(selected_features)}")
-    print(f"📈 Diagrams: ENABLED")
-    print(f"🌌 Mission: K2 (2014-2018)")
+    logging.info("=" * 60)
+    logging.info("🚀 K2 Mission Model Server Ready")
+    logging.info("=" * 60)
+    logging.info(f"📊 Model loaded: {model_loaded}")
+    logging.info(f"🔧 Features loaded: {len(selected_features)}")
+    logging.info(f"📈 Diagrams enabled: {ENABLE_DIAGRAMS}")
     
-    if preprocessor:
-        print(f"🎯 Classes: {preprocessor['label_encoder_classes']}")
-    
-    print("\n📋 Available endpoints:")
-    print("  GET  /                     - Server info")
-    print("  GET  /health               - Health check")
-    print("  GET  /model_info           - Model information")
-    print("  POST /predict              - Make K2 predictions with diagrams")
-    print("  GET  /model/performance    - Performance metrics")
-    print("  GET  /k2/mission_info      - K2 mission details")
-    print("=" * 60)
-    
-    # Run the app
-    app.run(host='127.0.0.1', port=5003, debug=False, threaded=True)
+    if preprocessor and 'label_encoder_classes' in preprocessor:
+        logging.info(f"🎯 Classes: {preprocessor['label_encoder_classes']}")
+
+    logging.info("\n📋 Available endpoints:\n  GET  / - Server info\n  GET  /health - Health check\n  GET  /model_info - Model information\n  POST /predict - Make K2 predictions with diagrams\n  GET  /model/performance - Performance metrics\n  GET  /k2/mission_info - K2 mission details\n")
+
+    # Run the app listening on the env-provided PORT (Hugging Face compatible)
+    port = int(os.environ.get('PORT', 7860))
+    debug = os.environ.get('FLASK_DEBUG', 'false').lower() == 'true'
+    app.run(host='0.0.0.0', port=port, debug=debug)
